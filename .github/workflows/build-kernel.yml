@@ -80,14 +80,13 @@ jobs:
       - name: Build kernel
         run: |
           cd kernel
-          # Thêm SKIP_DEFCONFIG_VALIDATION=1 để không bị lỗi so khớp gki_defconfig của Google
           BUILD_CONFIG=common/build.config.gki.aarch64 LTO=thin SKIP_MRPROPER=0 SKIP_DEFCONFIG_VALIDATION=1 build/build.sh 2>&1 | tee /tmp/build.log
         timeout-minutes: 90
 
       - name: Download magiskboot
         run: |
-          # Tải magiskboot bản prebuilt x86_64 chính thức dùng riêng cho môi trường Linux từ tiann (KernelSU)
-          wget -q "https://github.com/tiann/KernelSU/raw/main/kernel/gki/magiskboot" -O magiskboot
+          # Sử dụng một bản sao lưu magiskboot Linux x86_64 chính thức hoạt động ổn định từ công cụ nhà phát triển
+          wget -q "https://github.com/xiaoxindada/magiskboot_ndk_on_linux/raw/main/magiskboot" -O magiskboot
           chmod +x magiskboot
 
       - name: Repack boot.img
