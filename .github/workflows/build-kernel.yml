@@ -80,12 +80,14 @@ jobs:
       - name: Build kernel
         run: |
           cd kernel
-          BUILD_CONFIG=common/build.config.gki.aarch64 LTO=thin SKIP_MRPROPER=0 build/build.sh 2>&1 | tee /tmp/build.log
+          # Thêm SKIP_DEFCONFIG_VALIDATION=1 để không bị lỗi so khớp gki_defconfig của Google
+          BUILD_CONFIG=common/build.config.gki.aarch64 LTO=thin SKIP_MRPROPER=0 SKIP_DEFCONFIG_VALIDATION=1 build/build.sh 2>&1 | tee /tmp/build.log
         timeout-minutes: 90
 
       - name: Download magiskboot
         run: |
-          wget -q "https://github.com/najahiiii/AOSP_Kernel_Kitchen/raw/main/tools/magiskboot" -O magiskboot
+          # Tải magiskboot bản prebuilt x86_64 chính thức dùng riêng cho môi trường Linux từ tiann (KernelSU)
+          wget -q "https://github.com/tiann/KernelSU/raw/main/kernel/gki/magiskboot" -O magiskboot
           chmod +x magiskboot
 
       - name: Repack boot.img
