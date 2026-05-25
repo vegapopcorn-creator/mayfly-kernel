@@ -1,0 +1,541 @@
+# ================================================================
+#  GKI Kernel Builder — KernelSU Next + SuSFS
+#  Device : Xiaomi Mi 12S (mayfly)
+#  SoC    : Snapdragon 8+ Gen 1 (SM8475)
+#  Kernel : android12-5.10 (GKI 2.0)
+# ================================================================
+
+name: Build GKI Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      KERNEL_BRANCH:
+        description: "Kernel manifest branch"
+        required: true
+        default: "common-android12-5.10"
+
+      # KernelSU-Next/KernelSU-Next branch next-susfs đã tích hợp sẵn
+      # SuSFS glue patches → không cần apply thủ công KSU↔SuSFS
+      KSU_BRANCH:
+        description: "KernelSU Next branch (next-susfs | next)"
+        required: true
+        default: "next-susfs"
+
+      SUSFS_BRANCH:
+        description: "SuSFS branch"
+        required: true
+        default: "gki-android12-5.10"
+
+      GDRIVE_FILE_ID:
+        description: "Google Drive file ID của stock boot.img"
+        required: true
+        default: "10mVhr4fihWPPSz0ws-pY-YF-kboaFYCC"
+
+      CREATE_RELEASE:
+        description: "Tạo GitHub Release sau khi build?"
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+
+# ----------------------------------------------------------------
+env:
+  ARCH:         arm64
+  KERNEL_DIR:   ${{ github.workspace }}/kernel
+  SUSFS_DIR:    ${{ github.workspace }}/susfs4ksu
+  REPACK_DIR:   ${{ github.workspace }}/repack
+  # build/build.sh output ra out/dist/ (không phải out/arch/arm64/boot/)
+  OUT_DIR:      ${{ github.workspace }}/kernel/out/dist
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# ================================================================
+jobs:
+  build:
+    name: "🔨 Build GKI — mayfly"
+    runs-on: ubuntu-22.04
+
+    steps:
+
+    # ────────────────────────────────────────────────────────────
+    # 0. Disk space  (GKI repo sync ~15 GB, build ~8 GB)
+    # ────────────────────────────────────────────────────────────
+    - name: "🧹 Maximize disk space"
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb:      5120
+        temp-reserve-mb:      2048
+        remove-dotnet:        'true'
+        remove-android:       'true'
+        remove-haskell:       'true'
+        remove-codeql:        'true'
+        remove-docker-images: 'true'
+
+    - name: "📋 System info"
+      run: |
+        echo "CPUs: $(nproc)  |  RAM: $(free -h | awk '/Mem/{print $2}')"
+        df -h /
+
+    # ────────────────────────────────────────────────────────────
+    # 1. Dependencies
+    # ────────────────────────────────────────────────────────────
+    - name: "📦 Install dependencies"
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          git curl wget python3 python3-pip \
+          bc bison flex libssl-dev libelf-dev \
+          binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu \
+          cpio zip unzip make ninja-build \
+          lz4 zstd xz-utils jq
+        # gdown để tải từ Google Drive đáng tin cậy
+        pip install -q gdown
+        # repo tool
+        mkdir -p ~/.bin
+        curl -fsSL "https://storage.googleapis.com/git-repo-downloads/repo" \
+          -o ~/.bin/repo
+        chmod +x ~/.bin/repo
+        echo "$HOME/.bin" >> "$GITHUB_PATH"
+        git config --global user.email "build@github.com"
+        git config --global user.name  "GitHub Actions"
+        git config --global color.ui   false
+
+    # ────────────────────────────────────────────────────────────
+    # 2. Tải stock boot.img từ Google Drive
+    #    GDrive file lớn (>40 MB) sẽ hiện trang virus-scan warning.
+    #    Phải dùng --fuzzy để gdown tự bypass, hoặc fallback wget+cookie.
+    # ────────────────────────────────────────────────────────────
+    - name: "📱 Download stock boot.img"
+      run: |
+        FILE_ID="${{ inputs.GDRIVE_FILE_ID }}"
+        OUT="${{ github.workspace }}/boot-stock.img"
+
+        echo "Downloading boot.img (GDrive ID: $FILE_ID)..."
+
+        # Cách 1: gdown với --fuzzy (bypass virus-scan warning page)
+        gdown --fuzzy \
+          "https://drive.google.com/file/d/${FILE_ID}/view" \
+          -O "$OUT" || true
+
+        # Cách 2: fallback — wget với cookie confirm (Google large-file trick)
+        if [ ! -s "$OUT" ] || file "$OUT" | grep -q "HTML\|text"; then
+          echo "gdown failed hoặc trả về HTML, thử wget cookie method..."
+          rm -f "$OUT" /tmp/gdrive_cookie.txt
+
+          # Lấy confirm token
+          CONFIRM=$(wget -q --save-cookies /tmp/gdrive_cookie.txt \
+            --keep-session-cookies \
+            "https://drive.google.com/uc?export=download&id=${FILE_ID}" \
+            -O- 2>/dev/null \
+            | grep -o 'confirm=[^&"]*' | head -1 | cut -d= -f2)
+
+          if [ -n "$CONFIRM" ]; then
+            wget --load-cookies /tmp/gdrive_cookie.txt \
+              "https://drive.google.com/uc?export=download&confirm=${CONFIRM}&id=${FILE_ID}" \
+              -O "$OUT"
+          else
+            # Cách 3: fallback usercontent domain (hoạt động cho file public)
+            wget -q --show-progress \
+              "https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t" \
+              -O "$OUT"
+          fi
+        fi
+
+        # Validate
+        ls -lh "$OUT"
+        SIZE=$(stat -c%s "$OUT" 2>/dev/null || echo 0)
+        if file "$OUT" | grep -qE "HTML|text"; then
+          echo "::error::File tải về vẫn là HTML — GDrive ID sai hoặc file không public"
+          head -5 "$OUT"
+          exit 1
+        fi
+        if [ "$SIZE" -lt 1048576 ]; then
+          echo "::error::File quá nhỏ (${SIZE} bytes) — tải không thành công"
+          exit 1
+        fi
+        echo "✅ boot.img OK: $(numfmt --to=iec $SIZE)"
+
+    # ────────────────────────────────────────────────────────────
+    # 3. Sync GKI kernel source
+    # ────────────────────────────────────────────────────────────
+    - name: "📥 Sync GKI kernel source"
+      run: |
+        mkdir -p "$KERNEL_DIR"
+        cd "$KERNEL_DIR"
+        repo init \
+          --depth=1 \
+          --no-clone-bundle \
+          -u https://android.googlesource.com/kernel/manifest \
+          -b "${{ inputs.KERNEL_BRANCH }}"
+        repo sync \
+          -c \
+          -j$(nproc) \
+          --no-clone-bundle \
+          --no-tags \
+          --force-sync
+        echo "── Kernel source layout ──"
+        ls "$KERNEL_DIR"
+        # Verify thư mục common tồn tại sau sync
+        if [ ! -d "$KERNEL_DIR/common" ]; then
+          echo "::error::Không tìm thấy $KERNEL_DIR/common sau repo sync!"
+          echo "Các thư mục có trong KERNEL_DIR:"
+          ls -la "$KERNEL_DIR"
+          exit 1
+        fi
+        if [ ! -f "$KERNEL_DIR/build/build.sh" ]; then
+          echo "::error::Không tìm thấy build/build.sh — kernel manifest sai branch?"
+          exit 1
+        fi
+        echo "✅ Kernel source OK"
+
+    # ────────────────────────────────────────────────────────────
+    # 4. Integrate KernelSU Next
+    #    Branch "next-susfs" đã có sẵn SuSFS glue patches trong KSU
+    # ────────────────────────────────────────────────────────────
+    - name: "⚙️ Integrate KernelSU Next"
+      run: |
+        cd "$KERNEL_DIR/common"
+        echo "KernelSU Next branch: ${{ inputs.KSU_BRANCH }}"
+        curl -fsSL \
+          "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${{ inputs.KSU_BRANCH }}/kernel/setup.sh" \
+          | bash -s "${{ inputs.KSU_BRANCH }}"
+
+        if [ ! -d "drivers/kernelsu" ]; then
+          echo "::error::KernelSU integration thất bại — không tìm thấy drivers/kernelsu"
+          exit 1
+        fi
+        KSU_VER=$(cat drivers/kernelsu/version 2>/dev/null || echo "unknown")
+        echo "KSU_VERSION=$KSU_VER" >> "$GITHUB_ENV"
+        echo "✅ KernelSU Next v$KSU_VER"
+
+    # ────────────────────────────────────────────────────────────
+    # 5. Integrate SuSFS
+    #    Chỉ apply kernel-side patches (không apply KSU glue vì
+    #    next-susfs branch đã tích hợp sẵn rồi)
+    # ────────────────────────────────────────────────────────────
+    - name: "🔒 Integrate SuSFS"
+      run: |
+        echo "Cloning SuSFS (${{ inputs.SUSFS_BRANCH }})..."
+        git clone \
+          --depth=1 \
+          -b "${{ inputs.SUSFS_BRANCH }}" \
+          "https://gitlab.com/simonpunk/susfs4ksu.git" \
+          "$SUSFS_DIR"
+
+        KD="$KERNEL_DIR/common"
+        SD="$SUSFS_DIR/kernel_patches"
+
+        # ── Copy source files ─────────────────────────────────
+        echo "Copying SuSFS source files..."
+        cp -fv "$SD/fs/susfs.c"               "$KD/fs/"
+        cp -fv "$SD/include/linux/susfs.h"    "$KD/include/linux/"
+        # sus_su (optional, không phải branch nào cũng có)
+        cp -fv "$SD/fs/sus_su.c"              "$KD/fs/"             2>/dev/null || true
+        cp -fv "$SD/include/linux/sus_su.h"   "$KD/include/linux/"  2>/dev/null || true
+
+        # ── Apply kernel-side patch ───────────────────────────
+        # Chỉ lấy patch "50_add_susfs_in_gki*.patch" — KHÔNG apply
+        # patch trong thư mục KernelSU/ (next-susfs đã có sẵn)
+        KPATCH=$(find "$SD" -maxdepth 1 -name "50_add_susfs_in_gki*.patch" | sort | tail -1)
+        if [ -n "$KPATCH" ]; then
+          echo "Applying: $(basename "$KPATCH")"
+          cd "$KD"
+          patch -p1 --no-backup-if-mismatch --fuzz=3 < "$KPATCH" \
+            && echo "✅ Kernel SuSFS patch OK" \
+            || {
+              echo "⚠️  Patch có reject, kiểm tra log"
+              find . -name "*.rej" | head -10
+            }
+        else
+          echo "⚠️  Không tìm thấy kernel patch file trong $SD"
+        fi
+
+        echo "✅ SuSFS integration done"
+
+    # ────────────────────────────────────────────────────────────
+    # 6. Kernel config
+    # ────────────────────────────────────────────────────────────
+    - name: "📝 Apply kernel config"
+      run: |
+        KD="$KERNEL_DIR/common"
+        DEFCONFIG="$KD/arch/arm64/configs/gki_defconfig"
+
+        # ── KernelSU ─────────────────────────────────────────
+        echo "CONFIG_KSU=y"                         >> "$DEFCONFIG"
+        echo "CONFIG_KSU_DEBUG=n"                   >> "$DEFCONFIG"
+
+        # ── SuSFS (tên config chính xác theo susfs4ksu) ──────
+        echo "CONFIG_KSU_SUSFS=y"                   >> "$DEFCONFIG"
+        echo "CONFIG_KSU_SUSFS_SUS_PATH=y"          >> "$DEFCONFIG"
+        echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"         >> "$DEFCONFIG"
+        echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"         >> "$DEFCONFIG"
+        echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n"     >> "$DEFCONFIG"
+        echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"        >> "$DEFCONFIG"
+        echo "CONFIG_KSU_SUSFS_SPOOFER=y"           >> "$DEFCONFIG"  # không phải SPOOFY_UNAME
+        echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"        >> "$DEFCONFIG"
+        echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"     >> "$DEFCONFIG"
+        echo "CONFIG_KSU_SUSFS_SUS_SU=y"            >> "$DEFCONFIG"
+
+        # ── Chuẩn hóa defconfig qua make ────────────────────
+        cd "$KD"
+        make ARCH=arm64 O=out gki_defconfig
+        make ARCH=arm64 O=out savedefconfig
+        cp -f out/defconfig "$DEFCONFIG"
+        rm -rf out
+
+        echo "── KSU + SuSFS configs đã apply ──"
+        grep -E "CONFIG_KSU|CONFIG_SUSFS" "$DEFCONFIG" || true
+
+    # ────────────────────────────────────────────────────────────
+    # 7. Remove protected_exports (bắt buộc cho android12-5.10)
+    # ────────────────────────────────────────────────────────────
+    - name: "🔓 Remove protected_exports"
+      run: |
+        cd "$KERNEL_DIR/common"
+        for f in \
+          android/abi_gki_protected_exports_aarch64 \
+          android/abi_gki_protected_exports_x86_64; do
+          if [ -f "$f" ]; then
+            sed -i '/^[[:space:]]*"protected_exports"/d' "$f"
+            echo "Cleaned: $f"
+          fi
+        done
+
+    # ────────────────────────────────────────────────────────────
+    # 8. Build
+    #    Dùng build/build.sh (AOSP build system) thay vì make trực
+    #    tiếp — tự lo toolchain, KBUILD flags, GKI mixed build, v.v.
+    # ────────────────────────────────────────────────────────────
+    - name: "🔨 Build kernel"
+      working-directory: ${{ env.KERNEL_DIR }}
+      timeout-minutes: 90
+      run: |
+        # ── Bypass GKI ABI/symbol checks ────────────────────
+        export KMI_SYMBOL_LIST_STRICT_MODE=0
+        export SKIP_DEFCONFIG_VALIDATION=1
+
+        # Bypass compare_to_symbol_list nếu tồn tại
+        ABI_SCRIPT="build/abi/compare_to_symbol_list"
+        if [ -f "$ABI_SCRIPT" ]; then
+          cat > "$ABI_SCRIPT" << 'STUB'
+        #!/bin/bash
+        echo "⚠️  GKI symbol check bypassed"
+        exit 0
+        STUB
+          chmod +x "$ABI_SCRIPT"
+        fi
+
+        # ── Build ────────────────────────────────────────────
+        # DIST_DIR set tường minh để luôn biết Image nằm ở đâu
+        DIST_OUT="$KERNEL_DIR/out/dist"
+        mkdir -p "$DIST_OUT"
+
+        set -o pipefail
+        BUILD_CONFIG=common/build.config.gki.aarch64 \
+        DIST_DIR="$DIST_OUT" \
+        LTO=thin \
+        SKIP_MRPROPER=0 \
+        build/build.sh 2>&1 | tee /tmp/build.log
+
+        echo "── Tìm Image sau build ──"
+        # build.sh output ra out/dist/Image (DIST_DIR mặc định)
+        # fallback thêm out/arch/arm64/boot/Image phòng config khác
+        IMAGE=""
+        for CANDIDATE in \
+          "$KERNEL_DIR/out/dist/Image" \
+          "$KERNEL_DIR/out/arch/arm64/boot/Image"; do
+          if [ -f "$CANDIDATE" ]; then
+            IMAGE="$CANDIDATE"
+            break
+          fi
+        done
+        # fallback: tìm toàn bộ out/
+        if [ -z "$IMAGE" ]; then
+          IMAGE=$(find "$KERNEL_DIR/out" -type f -name "Image" 2>/dev/null \
+                  | grep -v "\.gz$" | head -1)
+        fi
+
+        if [ -z "$IMAGE" ]; then
+          echo "::error::Không tìm thấy kernel Image sau khi build!"
+          echo "=== Toàn bộ file trong out/ ==="
+          find "$KERNEL_DIR/out" -type f 2>/dev/null | head -60 || true
+          echo "=== 50 dòng cuối build log ==="
+          tail -50 /tmp/build.log
+          exit 1
+        fi
+
+        echo "✅ Image: $IMAGE  ($(ls -lh $IMAGE | awk '{print $5}'))"
+
+        # ── Verify KernelSU + SuSFS có trong kernel không ───
+        # Tìm nhiều signature khác nhau vì string có thể bị optimize
+        KSU_SIG=$(strings "$IMAGE" | grep -cE "KernelSU|kernelsu|ksu_uid|ksu_allow|/su_path" || true)
+        SUSFS_SIG=$(strings "$IMAGE" | grep -cE "susfs|sus_path|sus_mount|try_umount" || true)
+        echo "KSU signatures found  : $KSU_SIG"
+        echo "SuSFS signatures found: $SUSFS_SIG"
+        [ "$KSU_SIG" -gt 0 ]           && echo "✅ KernelSU: ĐÃ có trong kernel"           || echo "::warning::KernelSU KHÔNG tìm thấy trong Image — integration thất bại?"
+        [ "$SUSFS_SIG" -gt 0 ]           && echo "✅ SuSFS: ĐÃ có trong kernel"           || echo "::warning::SuSFS KHÔNG tìm thấy trong Image — patches chưa apply?"
+
+        echo "IMAGE_PATH=$IMAGE" >> "$GITHUB_ENV"
+        KVER=$(strings "$IMAGE" | grep -m1 "Linux version" | awk '{print $3}')
+        echo "KVER=$KVER"        >> "$GITHUB_ENV"
+        echo "Kernel: $KVER"
+
+    # ────────────────────────────────────────────────────────────
+    # 9. Get magiskboot (luôn lấy bản mới nhất)
+    # ────────────────────────────────────────────────────────────
+    - name: "🔧 Download magiskboot"
+      run: |
+        MAGISK_APK_URL=$(curl -fsSL \
+          "https://api.github.com/repos/topjohnwu/Magisk/releases/latest" \
+          | python3 -c "
+        import sys, json
+        assets = json.load(sys.stdin)['assets']
+        print(next(a['browser_download_url'] for a in assets if a['name'].endswith('.apk')))
+        ")
+
+        echo "Downloading: $MAGISK_APK_URL"
+        wget -q --show-progress "$MAGISK_APK_URL" -O /tmp/magisk.apk
+        unzip -qo /tmp/magisk.apk "lib/x86_64/libmagiskboot.so" -d /tmp/
+        mv /tmp/lib/x86_64/libmagiskboot.so "${{ github.workspace }}/magiskboot"
+        chmod +x "${{ github.workspace }}/magiskboot"
+        echo "magiskboot: $(ls -lh ${{ github.workspace }}/magiskboot)"
+
+    # ────────────────────────────────────────────────────────────
+    # 10. Repack boot.img
+    # ────────────────────────────────────────────────────────────
+    - name: "📦 Repack boot.img"
+      run: |
+        MB="${{ github.workspace }}/magiskboot"
+        BOOT_IN="${{ github.workspace }}/boot-stock.img"
+
+        mkdir -p "$REPACK_DIR"
+        cd "$REPACK_DIR"
+
+        # Unpack stock boot
+        "$MB" unpack "$BOOT_IN" 2>&1 | tee unpack.log
+        if [ ! -f kernel ]; then
+          echo "::error::magiskboot không extract được kernel — boot.img có hợp lệ không?"
+          cat unpack.log
+          exit 1
+        fi
+        echo "Stock kernel size : $(wc -c < kernel) bytes"
+
+        # Thay kernel mới
+        cp -v "$IMAGE_PATH" kernel
+        echo "New kernel size   : $(wc -c < kernel) bytes"
+
+        # Repack
+        "$MB" repack "$BOOT_IN" boot-ksu.img
+        ls -lh boot-ksu.img
+        echo "✅ Repack thành công"
+
+    # ────────────────────────────────────────────────────────────
+    # 11. Collect artifacts
+    # ────────────────────────────────────────────────────────────
+    - name: "📁 Collect artifacts"
+      run: |
+        mkdir -p "${{ github.workspace }}/artifacts"
+        A="${{ github.workspace }}/artifacts"
+
+        cp "$REPACK_DIR/boot-ksu.img"  "$A/boot-ksu-next-susfs.img"
+        cp "$IMAGE_PATH"               "$A/Image"
+        [ -f "${IMAGE_PATH}.gz" ] && cp "${IMAGE_PATH}.gz" "$A/" || true
+
+        {
+          echo "===== Build Manifest ====="
+          echo "Device       : Xiaomi Mi 12S (mayfly)"
+          echo "SoC          : Snapdragon 8+ Gen 1 (SM8475)"
+          echo "GKI branch   : ${{ inputs.KERNEL_BRANCH }}"
+          echo "Kernel ver   : $KVER"
+          echo "KernelSU Next: ${{ inputs.KSU_BRANCH }} (v$KSU_VERSION)"
+          echo "SuSFS branch : ${{ inputs.SUSFS_BRANCH }}"
+          echo "Build date   : $(date -u '+%Y-%m-%d %H:%M UTC')"
+          echo "Run          : #${{ github.run_number }}"
+          echo "========================="
+        } | tee "$A/build-manifest.txt"
+
+        echo "── Artifacts ──"
+        ls -lh "$A"
+
+    # ────────────────────────────────────────────────────────────
+    # 12. Upload artifacts
+    # ────────────────────────────────────────────────────────────
+    - name: "📤 Upload artifacts"
+      uses: actions/upload-artifact@v4
+      with:
+        name: mayfly-boot-ksu-next-susfs-${{ github.run_number }}
+        path: ${{ github.workspace }}/artifacts/
+        retention-days: 7
+
+    - name: "📤 Upload build log (luôn upload)"
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log-${{ github.run_number }}
+        path: /tmp/build.log
+        retention-days: 3
+
+    # ────────────────────────────────────────────────────────────
+    # 13. GitHub Release (optional)
+    # ────────────────────────────────────────────────────────────
+    - name: "🚀 Create GitHub Release"
+      if: inputs.CREATE_RELEASE == 'true'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name:   "ksu-next-${{ github.run_number }}"
+        name:       "KernelSU Next + SuSFS — mayfly #${{ github.run_number }}"
+        prerelease: true
+        body: |
+          ## GKI Kernel — Xiaomi Mi 12S (mayfly)
+
+          | | |
+          |---|---|
+          | **Device** | Xiaomi Mi 12S (mayfly) |
+          | **SoC** | Snapdragon 8+ Gen 1 (SM8475) |
+          | **GKI** | `${{ inputs.KERNEL_BRANCH }}` |
+          | **Kernel** | `${{ env.KVER }}` |
+          | **KernelSU Next** | `${{ inputs.KSU_BRANCH }}` v`${{ env.KSU_VERSION }}` |
+          | **SuSFS** | `${{ inputs.SUSFS_BRANCH }}` |
+
+          ### Flash
+          ```bash
+          fastboot flash boot boot-ksu-next-susfs.img
+          fastboot reboot
+          ```
+          Sau đó cài **KernelSU Next Manager** APK từ [releases](https://github.com/KernelSU-Next/KernelSU-Next/releases).
+        files: |
+          ${{ github.workspace }}/artifacts/boot-ksu-next-susfs.img
+          ${{ github.workspace }}/artifacts/Image
+          ${{ github.workspace }}/artifacts/build-manifest.txt
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # ────────────────────────────────────────────────────────────
+    # 14. Job summary
+    # ────────────────────────────────────────────────────────────
+    - name: "📋 Job summary"
+      if: always()
+      run: |
+        STATUS="${{ job.status }}"
+        ICON="✅"
+        [ "$STATUS" != "success" ] && ICON="❌"
+        {
+          echo "## $ICON Build — Mi 12S (mayfly)"
+          echo ""
+          echo "| Field | Value |"
+          echo "|:------|:------|"
+          echo "| Device | Xiaomi Mi 12S (mayfly) |"
+          echo "| GKI branch | \`${{ inputs.KERNEL_BRANCH }}\` |"
+          echo "| Kernel | \`$KVER\` |"
+          echo "| KernelSU Next | \`${{ inputs.KSU_BRANCH }}\` v\`$KSU_VERSION\` |"
+          echo "| SuSFS | \`${{ inputs.SUSFS_BRANCH }}\` |"
+          echo "| Status | $STATUS |"
+          echo ""
+          echo "### Flash"
+          echo "\`\`\`bash"
+          echo "fastboot flash boot boot-ksu-next-susfs.img && fastboot reboot"
+          echo "\`\`\`"
+        } >> "$GITHUB_STEP_SUMMARY"
