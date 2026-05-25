@@ -39,4 +39,80 @@ jobs:
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android12-5.10 --depth=1 --no-clone-bundle
           repo sync -c -j$(nproc) --no-clone-bundle --no-tags
 
-      - name: Integr
+      - name: Integrate KernelSU Next
+        run: |
+          cd kernel/common
+          curl -fsSL "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs
+          echo "KernelSU Next patched"
+
+      - name: Clone and apply SuSFS patches
+        run: |
+          cd kernel
+          git clone --depth=1 -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          cd common
+          for patch in ../susfs4ksu/kernel_patches/*.patch; do
+            patch -p1 < "$patch" || echo "Patch failed: $patch"
+          done
+          echo "SuSFS patches applied"
+
+      - name: Remove protected_exports
+        run: |
+          cd kernel/common
+          sed -i '/^[[:space:]]*"protected_exports"/d' android/abi_gki_protected_exports_aarch64 2>/dev/null || true
+          sed -i '/^[[:space:]]*"protected_exports"/d' android/abi_gki_protected_exports_x86_64 2>/dev/null || true
+
+      - name: Apply kernel config
+        run: |
+          cd kernel/common
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_DEBUG=n" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_SPOOFY_UNAME=y" >> arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/gki_defconfig
+          echo "Config updated"
+
+      - name: Build kernel
+        run: |
+          cd kernel
+          BUILD_CONFIG=common/build.config.gki.aarch64 LTO=thin SKIP_MRPROPER=0 build/build.sh 2>&1 | tee /tmp/build.log
+        timeout-minutes: 90
+
+      - name: Download magiskboot
+        run: |
+          wget -q "https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk" -O magisk.apk
+          unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
+          chmod +x magiskboot
+
+      - name: Repack boot.img
+        run: |
+          KERNEL_IMAGE=$(find kernel -type f -name "Image" | grep -v "\.o" | head -1)
+          [ -z "$KERNEL_IMAGE" ] && KERNEL_IMAGE=$(find kernel -type f -name "Image.lz4" | grep -v "\.o" | head -1)
+          [ -z "$KERNEL_IMAGE" ] && KERNEL_IMAGE=$(find kernel -type f -name "Image.gz" | grep -v "\.o" | head -1)
+          echo "Found: $KERNEL_IMAGE"
+          mkdir -p repack && cd repack
+          cp "${{ github.workspace }}/boot.img" ./boot.img
+          ../magiskboot unpack boot.img
+          cp "${{ github.workspace }}/$KERNEL_IMAGE" ./kernel
+          ../magiskboot repack boot.img new-boot.img
+          ls -lh new-boot.img
+
+      - name: Upload new-boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: mayfly-boot-ksu-susfs-${{ github.run_number }}
+          path: repack/new-boot.img
+          retention-days: 7
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: /tmp/build.log
+          retention-days: 3
