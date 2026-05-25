@@ -10,6 +10,7 @@ jobs:
     env:
       ARCH: arm64
       GDRIVE_FILE_ID: 10mVhr4fihWPPSz0ws-pY-YF-kboaFYCC
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout repo
@@ -76,7 +77,7 @@ jobs:
           echo "CONFIG_KSU_SUSFS_SPOOFY_UNAME=y" >> arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/gki_defconfig
           
-          # Chuẩn hóa tệp cấu hình kịch bản
+          # Hợp thức hóa file cấu hình defconfig bằng savedefconfig của nhân
           make ARCH=arm64 O=out gki_defconfig
           make ARCH=arm64 O=out savedefconfig
           cp -f out/defconfig arch/arm64/configs/gki_defconfig
@@ -89,7 +90,7 @@ jobs:
           export KMI_SYMBOL_LIST_STRICT_MODE=0
           export SKIP_DEFCONFIG_VALIDATION=1
           
-          # Ép bẻ gãy lớp kiểm tra so khớp danh sách biểu tượng (KMI Symbol) của Google GKI
+          # Vượt qua bộ lọc so khớp nghiêm ngặt danh sách KMI Symbol của Google
           if [ -f "build/abi/compare_to_symbol_list" ]; then
             echo "#!/bin/bash" > build/abi/compare_to_symbol_list
             echo "echo 'Bypassed GKI Symbol check successfully'" >> build/abi/compare_to_symbol_list
@@ -101,7 +102,7 @@ jobs:
 
       - name: Download magiskboot
         run: |
-          # Giả lập đầy đủ thông số User-Agent trình duyệt để vượt qua bộ lọc chặn kết nối của mạng máy chủ
+          # Giả lập User-Agent đầy đủ để vượt qua bộ chặn rate-limit của GitHub từ nhà mạng
           curl -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" -L -s "https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk" -o magisk.apk
           unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
           rm -f magisk.apk
@@ -110,22 +111,34 @@ jobs:
 
       - name: Repack boot.img
         run: |
-          KERNEL_IMAGE=$(find kernel/out -type f -name "Image" 2>/dev/null | head -1)
-          [ -z "$KERNEL_IMAGE" ] && KERNEL_IMAGE=$(find kernel -type f -name "Image" | grep -v "\.o" | head -1)
-          [ -z "$KERNEL_IMAGE" ] && KERNEL_IMAGE=$(find kernel -type f -name "Image.lz4" | grep -v "\.o" | head -1)
-          [ -z "$KERNEL_IMAGE" ] && KERNEL_IMAGE=$(find kernel -type f -name "Image.gz" | grep -v "\.o" | head -1)
+          # Khai báo đường dẫn cố định tuyệt đối tới file lõi Image vừa build ra (không dùng find mù quáng)
+          TARGET_IMAGE="kernel/out/android12-5.10/common/arch/arm64/boot/Image"
           
-          if [ -z "$KERNEL_IMAGE" ] || [ -d "$KERNEL_IMAGE" ]; then
-            echo "ERROR: Không tìm thấy file kernel Image!"
+          # Nếu build.sh xuất dạng nén lz4/gz, tự động cập nhật
+          [ ! -f "$TARGET_IMAGE" ] && TARGET_IMAGE=$(find kernel/out -type f -name "Image" -o -name "Image.lz4" -o -name "Image.gz" | grep -v "\.o" | head -1)
+          [ -z "$TARGET_IMAGE" ] && TARGET_IMAGE=$(find kernel -type f -name "Image" | grep -v "\.o" | grep "boot/Image" | head -1)
+          
+          if [ -z "$TARGET_IMAGE" ] || [ -d "$TARGET_IMAGE" ]; then
+            echo "ERROR: Không tìm thấy file kernel lõi Image hợp lệ!"
             exit 1
           fi
           
-          echo "Found Kernel Image: $KERNEL_IMAGE"
+          echo "-> Tìm thấy file Kernel Image chuẩn tại: $TARGET_IMAGE"
           mkdir -p repack && cd repack
+          
+          # Copy boot.img gốc từ Google Drive vào
           cp "${{ github.workspace }}/boot.img" ./boot.img
+          
+          # Bung boot.img gốc
           ../magiskboot unpack boot.img
-          cp -f "${{ github.workspace }}/$KERNEL_IMAGE" ./kernel
+          
+          # Ghi đè file nhân mới vào (ép buộc xóa bỏ bản cũ nếu có)
+          rm -f ./kernel
+          cp -f "${{ github.workspace }}/$TARGET_IMAGE" ./kernel
+          
+          # Đóng gói lại thành phẩm
           ../magiskboot repack boot.img new-boot.img
+          echo "-> Kích thước file boot.img thành phẩm sau repack:"
           ls -lh new-boot.img
 
       - name: Upload new-boot.img
