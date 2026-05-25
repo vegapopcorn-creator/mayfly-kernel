@@ -75,23 +75,24 @@ jobs:
           echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_SPOOFY_UNAME=y" >> arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/gki_defconfig
-          echo "Config updated"
+          
+          # Thực hiện chuẩn hóa lại tệp defconfig để vượt qua bộ lọc kiểm tra nghiêm ngặt của build.sh
+          make ARCH=arm64 O=out gki_defconfig
+          make ARCH=arm64 O=out savedefconfig
+          cp -f out/defconfig arch/arm64/configs/gki_defconfig
+          rm -rf out
+          echo "Cấu hình defconfig đã được chuẩn hóa!"
 
       - name: Build kernel
         run: |
           cd kernel
-          # Đồng bộ lại cấu hình chuẩn hóa savedefconfig để Google không báo lỗi khớp config
-          export MIXER_EXT_DEFCONFIG=common/arch/arm64/configs/gki_defconfig
-          export SKIP_DEFCONFIG_VALIDATION=1
           BUILD_CONFIG=common/build.config.gki.aarch64 LTO=thin SKIP_MRPROPER=0 build/build.sh 2>&1 | tee /tmp/build.log
         timeout-minutes: 90
 
       - name: Download magiskboot
         run: |
-          # Sử dụng GitHub API để tự động lấy link tải Magisk chính chủ phiên bản mới nhất
-          MAGISK_URL=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url')
-          wget -q "$MAGISK_URL" -O magisk.apk
-          # Giải nén trực tiếp công cụ magiskboot dành cho kiến trúc Linux x86_64 ra ngoài môi trường build
+          # Sử dụng liên kết phân phối CDN trực tiếp để tải về gói ứng dụng Magisk chính thức, loại bỏ hoàn toàn lỗi API Rate Limit 
+          wget -q "https://cdn.jsdelivr.net/gh/topjohnwu/Magisk@v27.0/app-release.apk" -O magisk.apk
           unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
           chmod +x magiskboot
           ls -lh magiskboot
@@ -104,7 +105,7 @@ jobs:
           [ -z "$KERNEL_IMAGE" ] && KERNEL_IMAGE=$(find kernel -type f -name "Image.gz" | grep -v "\.o" | head -1)
           
           if [ -z "$KERNEL_IMAGE" ] || [ -d "$KERNEL_IMAGE" ]; then
-            echo "ERROR: Cannot find valid Kernel Image file!"
+            echo "ERROR: Không tìm thấy file kernel Image được biên dịch ra!"
             exit 1
           fi
           
