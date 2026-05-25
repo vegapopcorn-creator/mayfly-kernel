@@ -2,32 +2,17 @@ name: Build GKI Kernel - mayfly (KernelSU Next + SuSFS)
 
 on:
   workflow_dispatch:
-    inputs:
-      kernelsu_branch:
-        description: 'KernelSU Next branch'
-        required: true
-        default: 'next-susfs'
-      susfs_branch:
-        description: 'SuSFS branch'
-        required: true
-        default: 'gki-android12-5.10'
-      upload_artifact:
-        description: 'Upload boot.img as artifact'
-        required: true
-        default: 'true'
-        type: boolean
 
 jobs:
   build:
     name: Build GKI 5.10 + KSU Next + SuSFS
     runs-on: ubuntu-22.04
     env:
-      KERNEL_VERSION: "android12-5.10"
       ARCH: arm64
-      CC: clang
+      GDRIVE_FILE_ID: 10mVhr4fihWPPSz0ws-pY-YF-kboaFYCC
 
     steps:
-      - name: Checkout repo (for scripts/configs)
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Install dependencies
@@ -46,6 +31,13 @@ jobs:
           curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
           chmod a+x ~/.bin/repo
           echo "$HOME/.bin" >> $GITHUB_PATH
+
+      - name: Download boot.img from Google Drive
+        run: |
+          pip install -q gdown
+          gdown "https://drive.google.com/uc?id=${GDRIVE_FILE_ID}" -O boot.img
+          ls -lh boot.img
+          echo "✅ boot.img downloaded"
 
       - name: Initialize GKI kernel repo (android12-5.10)
         run: |
@@ -92,7 +84,7 @@ jobs:
           sed -i '/^[[:space:]]*"protected_exports"/d' android/abi_gki_protected_exports_aarch64 2>/dev/null || true
           sed -i '/^[[:space:]]*"protected_exports"/d' android/abi_gki_protected_exports_x86_64 2>/dev/null || true
 
-      - name: Apply kernel config for SuSFS + KSU
+      - name: Apply kernel config for KSU + SuSFS
         run: |
           cd kernel/common
           cat >> arch/arm64/configs/gki_defconfig << 'EOF'
@@ -108,6 +100,7 @@ jobs:
           CONFIG_KSU_SUSFS_SPOOFY_UNAME=y
           CONFIG_KSU_SUSFS_ENABLE_LOG=y
           EOF
+          echo "✅ Kernel config updated"
 
       - name: Build kernel
         run: |
@@ -120,9 +113,12 @@ jobs:
 
       - name: Download magiskboot
         run: |
-          wget -q "https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk" -O magisk.apk
+          wget -q \
+            "https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk" \
+            -O magisk.apk
           unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
           chmod +x magiskboot
+          echo "✅ magiskboot ready"
 
       - name: Repack boot.img with new kernel
         run: |
@@ -131,9 +127,11 @@ jobs:
           ../magiskboot unpack boot.img
           KERNEL_IMAGE=$(find ../kernel/out -name "Image" | head -1)
           [ -z "$KERNEL_IMAGE" ] && KERNEL_IMAGE=$(find ../kernel/out -name "Image.lz4" | head -1)
+          echo "Using kernel: $KERNEL_IMAGE"
           cp "$KERNEL_IMAGE" ./kernel
           ../magiskboot repack boot.img new-boot.img
           ls -lh new-boot.img
+          echo "✅ new-boot.img ready"
 
       - name: Upload new-boot.img
         uses: actions/upload-artifact@v4
@@ -149,3 +147,12 @@ jobs:
           name: build-log-${{ github.run_number }}
           path: /tmp/build.log
           retention-days: 3
+
+      - name: Done
+        run: |
+          echo "============================================"
+          echo "✅ Build complete!"
+          echo "Kernel : 5.10 GKI + KernelSU Next + SuSFS"
+          echo "Device : Xiaomi Mi 12S (mayfly)"
+          echo "Flash  : fastboot flash boot new-boot.img"
+          echo "============================================"
