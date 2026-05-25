@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends git curl wget python3 python3-pip bc bison flex libssl-dev libelf-dev binutils-aarch64-linux-gnu cpio zip unzip make ninja-build lz4 zstd
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends git curl wget python3 python3-pip bc bison flex libssl-dev libelf-dev binutils-aarch64-linux-gnu cpio zip unzip make ninja-build lz4 zstd jq
 
       - name: Install repo tool
         run: |
@@ -80,14 +80,21 @@ jobs:
       - name: Build kernel
         run: |
           cd kernel
-          BUILD_CONFIG=common/build.config.gki.aarch64 LTO=thin SKIP_MRPROPER=0 SKIP_DEFCONFIG_VALIDATION=1 build/build.sh 2>&1 | tee /tmp/build.log
+          # Đồng bộ lại cấu hình chuẩn hóa savedefconfig để Google không báo lỗi khớp config
+          export MIXER_EXT_DEFCONFIG=common/arch/arm64/configs/gki_defconfig
+          export SKIP_DEFCONFIG_VALIDATION=1
+          BUILD_CONFIG=common/build.config.gki.aarch64 LTO=thin SKIP_MRPROPER=0 build/build.sh 2>&1 | tee /tmp/build.log
         timeout-minutes: 90
 
       - name: Download magiskboot
         run: |
-          # Sử dụng một bản sao lưu magiskboot Linux x86_64 chính thức hoạt động ổn định từ công cụ nhà phát triển
-          wget -q "https://github.com/xiaoxindada/magiskboot_ndk_on_linux/raw/main/magiskboot" -O magiskboot
+          # Sử dụng GitHub API để tự động lấy link tải Magisk chính chủ phiên bản mới nhất
+          MAGISK_URL=$(curl -s https://api.github.com/repos/topjohnwu/Magisk/releases/latest | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url')
+          wget -q "$MAGISK_URL" -O magisk.apk
+          # Giải nén trực tiếp công cụ magiskboot dành cho kiến trúc Linux x86_64 ra ngoài môi trường build
+          unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
           chmod +x magiskboot
+          ls -lh magiskboot
 
       - name: Repack boot.img
         run: |
