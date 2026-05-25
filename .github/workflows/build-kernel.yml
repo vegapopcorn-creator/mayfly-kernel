@@ -129,4 +129,16 @@ jobs:
           ls -lh new-boot.img
 
       - name: Upload new-boot.img
-        uses: actions/upload-artifact@v
+        uses: actions/upload-artifact@v4
+        with:
+          name: mayfly-boot-ksu-susfs-${{ github.run_number }}
+          path: repack/new-boot.img
+          retention-days: 7
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: /tmp/build.log
+          retention-days: 3
