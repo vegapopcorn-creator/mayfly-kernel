@@ -77,7 +77,6 @@ jobs:
           echo "CONFIG_KSU_SUSFS_SPOOFY_UNAME=y" >> arch/arm64/configs/gki_defconfig
           echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/gki_defconfig
           
-          # Hợp thức hóa file cấu hình defconfig bằng savedefconfig của nhân
           make ARCH=arm64 O=out gki_defconfig
           make ARCH=arm64 O=out savedefconfig
           cp -f out/defconfig arch/arm64/configs/gki_defconfig
@@ -90,7 +89,6 @@ jobs:
           export KMI_SYMBOL_LIST_STRICT_MODE=0
           export SKIP_DEFCONFIG_VALIDATION=1
           
-          # Vượt qua bộ lọc so khớp nghiêm ngặt danh sách KMI Symbol của Google
           if [ -f "build/abi/compare_to_symbol_list" ]; then
             echo "#!/bin/bash" > build/abi/compare_to_symbol_list
             echo "echo 'Bypassed GKI Symbol check successfully'" >> build/abi/compare_to_symbol_list
@@ -102,7 +100,6 @@ jobs:
 
       - name: Download magiskboot
         run: |
-          # Giả lập User-Agent đầy đủ để vượt qua bộ chặn rate-limit của GitHub từ nhà mạng
           curl -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" -L -s "https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk" -o magisk.apk
           unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
           rm -f magisk.apk
@@ -111,34 +108,39 @@ jobs:
 
       - name: Repack boot.img
         run: |
-          # Khai báo đường dẫn cố định tuyệt đối tới file lõi Image vừa build ra (không dùng find mù quáng)
-          TARGET_IMAGE="kernel/out/android12-5.10/common/arch/arm64/boot/Image"
+          # Tìm kiếm file Image trên toàn bộ phân vùng workspace, loại bỏ các file .o hoặc thư mục trùng tên
+          TARGET_IMAGE=$(find kernel/out -type f -name "Image" 2>/dev/null | head -n 1)
           
-          # Nếu build.sh xuất dạng nén lz4/gz, tự động cập nhật
-          [ ! -f "$TARGET_IMAGE" ] && TARGET_IMAGE=$(find kernel/out -type f -name "Image" -o -name "Image.lz4" -o -name "Image.gz" | grep -v "\.o" | head -1)
-          [ -z "$TARGET_IMAGE" ] && TARGET_IMAGE=$(find kernel -type f -name "Image" | grep -v "\.o" | grep "boot/Image" | head -1)
+          # Nếu tìm trong out không thấy, mở rộng tìm kiếm trên toàn bộ thư mục kernel
+          if [ -z "$TARGET_IMAGE" ]; then
+            TARGET_IMAGE=$(find kernel -type f -path "*/boot/Image" 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$TARGET_IMAGE" ]; then
+            TARGET_IMAGE=$(find kernel -type f -name "Image" | grep -v "\.o" | head -n 1)
+          fi
           
-          if [ -z "$TARGET_IMAGE" ] || [ -d "$TARGET_IMAGE" ]; then
-            echo "ERROR: Không tìm thấy file kernel lõi Image hợp lệ!"
+          # TRƯỜNG HỢP KHẨN CẤP: Nếu vẫn không thấy, quét sạch toàn bộ file để hiển thị lên log cho người dùng kiểm tra
+          if [ -z "$TARGET_IMAGE" ] || [ ! -f "$TARGET_IMAGE" ]; then
+            echo "❌ ERROR: Không tìm thấy file Image bằng lệnh thông thường!"
+            echo "=== DANH SÁCH TẤT CẢ FILE TRONG THƯ MỤC OUT ==="
+            find kernel/out -type f 2>/dev/null || true
             exit 1
           fi
           
-          echo "-> Tìm thấy file Kernel Image chuẩn tại: $TARGET_IMAGE"
+          echo "✅ ĐÃ TÌM THẤY KERNEL IMAGE TẠI: $TARGET_IMAGE"
+          echo "Kích thước nhân thực tế:"
+          ls -lh "$TARGET_IMAGE"
+          
           mkdir -p repack && cd repack
-          
-          # Copy boot.img gốc từ Google Drive vào
           cp "${{ github.workspace }}/boot.img" ./boot.img
-          
-          # Bung boot.img gốc
           ../magiskboot unpack boot.img
           
-          # Ghi đè file nhân mới vào (ép buộc xóa bỏ bản cũ nếu có)
-          rm -f ./kernel
-          cp -f "${{ github.workspace }}/$TARGET_IMAGE" ./kernel
+          # Ép xới và thay thế file nhân cũ
+          rm -f kernel
+          cp -v "${{ github.workspace }}/$TARGET_IMAGE" ./kernel
           
-          # Đóng gói lại thành phẩm
           ../magiskboot repack boot.img new-boot.img
-          echo "-> Kích thước file boot.img thành phẩm sau repack:"
+          echo "=== KÍCH THƯỚC FILE THÀNH PHẨM LÀM XONG ==="
           ls -lh new-boot.img
 
       - name: Upload new-boot.img
